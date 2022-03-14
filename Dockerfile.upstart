@@ -1,0 +1,101 @@
+# Copy from https://github.com/cxmcc/ubuntu-upstart/blob/master/16.04/Dockerfile
+FROM ubuntu:16.04 as build
+
+# Get rid of systemd
+RUN apt-get purge -y systemd --allow-remove-essential
+RUN apt-get update
+RUN apt-get install -y upstart locales sudo
+
+# much of this was gleaned from https://github.com/lxc/lxc/blob/lxc-0.8.0/templates/lxc-ubuntu.in
+# and then heavily modified and hacked like crazy
+
+ADD init-fake.conf /etc/init/fake-container-events.conf
+
+# undo some leet hax of the base image
+RUN rm /usr/sbin/policy-rc.d; \
+    rm /sbin/initctl; dpkg-divert --rename --remove /sbin/initctl
+
+# generate a nice UTF-8 locale for our use
+RUN locale-gen en_US.UTF-8 && update-locale LANG=en_US.UTF-8
+
+# remove some pointless services
+RUN /usr/sbin/update-rc.d -f ondemand remove; \
+    for f in \
+        /etc/init/u*.conf \
+        /etc/init/mounted-dev.conf \
+        /etc/init/mounted-proc.conf \
+        /etc/init/mounted-run.conf \
+        /etc/init/mounted-tmp.conf \
+        /etc/init/mounted-var.conf \
+        /etc/init/hostname.conf \
+        /etc/init/networking.conf \
+        /etc/init/tty*.conf \
+        /etc/init/plymouth*.conf \
+        /etc/init/hwclock*.conf \
+        /etc/init/module*.conf\
+    ; do \
+        dpkg-divert --local --rename --add "$f"; \
+    done; \
+    echo '# /lib/init/fstab: cleared out for bare-bones Docker' > /lib/init/fstab
+
+# Copy from https://github.com/kubernetes-sigs/kind/blob/v0.11.1/images/base/Dockerfile
+RUN mkdir /kind
+
+# Configure crictl binary from upstream
+ARG CRICTL_URL="https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.23.0/crictl-v1.23.0-linux-arm.tar.gz"
+
+# copy in static files
+# all scripts are 0755 (rwx r-x r-x)
+COPY --chmod=0755 files/usr/local/bin/* /usr/local/bin/
+
+# all configs are 0644 (rw- r-- r--)
+COPY --chmod=0644 files/etc/* /etc/
+COPY --chmod=0644 files/etc/containerd/* /etc/containerd/
+COPY --chmod=0644 files/etc/sysctl.d/* /etc/sysctl.d/
+COPY --chmod=0644 files/etc/systemd/system/* /etc/systemd/system/
+COPY --chmod=0644 files/etc/init/* /etc/init/
+
+RUN echo "Installing Packages ..." \
+    && apt-get install -y vim curl jq \
+      iptables iproute2 iputils-ping net-tools \
+      kmod systemd
+
+COPY --chmod=755 ./runc/* /usr/local/sbin/
+
+COPY --chmod=755 ./containerd/* /usr/local/bin/
+
+COPY --chmod=755 ./crictl /usr/local/bin/
+
+RUN mkdir -p /opt/cni/bin
+
+COPY --chmod=755 ./cni/cni-plugs/* /opt/cni/bin/
+
+COPY --chmod=755 ./cni/10-containerd-net.conflist /etc/cni/net.d/
+
+RUN echo "Installing containerd ..." \
+    && rm -f /usr/local/bin/containerd-stress /usr/local/bin/containerd-shim-runc-v1 \
+    && chmod 755 /usr/local/sbin/runc \
+    && ctr oci spec \
+        | jq '.hooks.createContainer[.hooks.createContainer| length] |= . + {"path": "/usr/local/bin/mount-product-files"}' \
+        | jq 'del(.process.rlimits)' \
+        > /etc/containerd/cri-base.json \
+    && containerd --version \
+    && runc --version
+
+# install edgecore
+RUN mkdir -p /etc/kubeedge/config
+COPY --chmod=755 ./edgecore /usr/local/bin/
+
+# squash
+FROM scratch
+COPY --from=build / /
+
+# tell systemd that it is in docker (it will check for the container env)
+# https://systemd.io/CONTAINER_INTERFACE/
+ENV container docker
+# systemd exits on SIGRTMIN+3, not SIGTERM (which re-executes it)
+# https://bugzilla.redhat.com/show_bug.cgi?id=1201657
+STOPSIGNAL SIGRTMIN+3
+
+# NOTE: this is *only* for documentation, the entrypoint is overridden later
+ENTRYPOINT [ "/usr/local/bin/entrypoint", "/sbin/upstart" ]
